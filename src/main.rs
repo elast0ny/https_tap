@@ -5,25 +5,31 @@ use mio::{Events, Interest, Poll, Registry, Token};
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::fs::File;
-use std::io::{self, BufReader, Read, Write};
+use std::io::{self, Read, Write};
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use env_logger::Env;
 use log::*;
 use structopt::StructOpt;
 use trust_dns_resolver::config::*;
 use trust_dns_resolver::Resolver;
-
+use native_tls::{TlsAcceptor, TlsConnector, TlsStream, MidHandshakeTlsStream};
 type Result<T> = std::result::Result<T, std::boxed::Box<dyn std::error::Error>>;
 
-struct Client {
-    tls: Box<dyn rustls::Session>,
-    socket: mio::net::TcpStream,
-    peer_id: usize,
-    remote_recv: Vec<u8>,
+struct Peer {
+    plain_sock: Option<TcpStream>,
+    mid_handshake_sock: Option<MidHandshakeTlsStream<TcpStream>>,
+    tls_sock: Option<TlsStream<TcpStream>>,
     is_loopback: bool,
-    loopback_id: usize,
+    forward_domain: Option<String>,
+    /// Contains the TLS session info if present
+    /// tls: Option<Box<dyn rustls::Session>>,
+    /// Id of the peer to forward the recv'ed data to
+    forward_id: Option<usize>,
+    /// Id of the loopback peer to forward decrypted traffic
+    loopback_id: Option<usize>,
+    /// Buffer containing data that has been received from this peer's remote endpoint
+    forward_buf: Vec<u8>,
 }
 
 #[derive(Debug, StructOpt)]
@@ -46,12 +52,46 @@ struct Args {
 }
 
 struct Ctx {
-    connections: HashMap<Token, Client>,
+    acceptor: TlsAcceptor,
+    connector: TlsConnector,
+    connections: HashMap<Token, Peer>,
     remote_port: u16,
     loopback_addr: String,
     unique_id: usize,
     loopback_id_queue: VecDeque<usize>,
     resolver: Resolver,
+}
+impl Ctx {
+    pub fn add_peer(&mut self, mut new_peer: Peer, registry: &Registry) -> Result<usize> {
+        let id = 
+        if new_peer.is_loopback {
+            if new_peer.forward_id.is_none() {
+                self.loopback_id_queue.pop_front().unwrap()
+            } else {
+                self.unique_id += 1;
+                self.loopback_id_queue.push_back(self.unique_id);
+                self.unique_id += 1;
+                self.unique_id
+            }
+        } else {
+            self.unique_id += 1;
+            self.unique_id
+        };
+        info!("New peer {} {}", id, if new_peer.is_loopback { "(Loopback)"} else {""});
+        registry.register(
+            new_peer.plain_sock.as_mut().unwrap(),
+            Token(id),
+            Interest::READABLE.add(Interest::WRITABLE)
+        )?;
+
+        // Add peer to our list of connections
+        self.connections.insert(
+            Token(id),
+            new_peer,
+        );
+
+        Ok(id)
+    }
 }
 
 const SERVER: usize = 0;
@@ -61,27 +101,34 @@ fn main() -> Result<()> {
     env_logger::from_env(Env::default().default_filter_or("info")).init();
     let args = Args::from_args();
 
-    let ssl_ctx = load_ssl_config(&args)?;
-
     info!("Binding to {}:{}", args.bind, args.port);
 
-    // Setup the TCP server socket.
+    // Read in certificates
+    let mut file = File::open("res/identity.pfx").unwrap();
+    let mut file_bytes = vec![];
+    file.read_to_end(&mut file_bytes)?;
+    let acceptor =
+        native_tls::TlsAcceptor::new(native_tls::Identity::from_pkcs12(&file_bytes, "letmein")?)?;
+
+    // Setup the server sockets
     let addr = format!("{}:{}", args.bind, args.port).parse().unwrap();
-    let mut listener = TcpListener::bind(addr)?;
-    let mut loopback = TcpListener::bind(args.loopback.parse()?)?;
+    let mut proxy_sock = TcpListener::bind(addr)?;
+    let mut loopback_sock = TcpListener::bind(args.loopback.parse()?)?;
+    
     // Create a poll instance.
     let mut poll = Poll::new()?;
-    // Create storage for events.
     let mut events = Events::with_capacity(128);
     poll.registry()
-        .register(&mut listener, Token(SERVER), Interest::READABLE)?;
+        .register(&mut proxy_sock, Token(SERVER), Interest::READABLE)?;
     poll.registry()
-        .register(&mut loopback, Token(LOOPBACK), Interest::READABLE)?;
+        .register(&mut loopback_sock, Token(LOOPBACK), Interest::READABLE)?;
     info!("Waiting for connections !");
     let mut res_opts = ResolverOpts::default();
     res_opts.use_hosts_file = false;
 
     let mut ctx = Ctx {
+        acceptor,
+        connector: TlsConnector::new().unwrap(),
         remote_port: args.port,
         connections: HashMap::new(),
         loopback_addr: args.loopback,
@@ -96,14 +143,14 @@ fn main() -> Result<()> {
         for event in events.iter() {
             match event.token().0 {
                 SERVER | LOOPBACK => loop {
-                    let is_loopback = event.token().0 == LOOPBACK;
-                    let listener_sock = if is_loopback {
-                        &mut loopback
+                    let (is_loopback, listen_sock) = if event.token().0 == LOOPBACK {
+                        (true, &mut loopback_sock)
                     } else {
-                        &mut listener
+                        (false, &mut proxy_sock)
                     };
 
-                    let (mut socket, _address) = match listener_sock.accept() {
+                    // Accept connection
+                    let (socket, _address) = match listen_sock.accept() {
                         Ok((socket, address)) => (socket, address),
                         Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                             break;
@@ -113,61 +160,25 @@ fn main() -> Result<()> {
                             continue;
                         }
                     };
-                    let id = Token(if is_loopback {
-                        ctx.loopback_id_queue.pop_front().unwrap()
-                    } else {
-                        ctx.unique_id += 1;
-                        ctx.unique_id
-                    });
 
-                    debug!("Accept peer {}", id.0);
+                    let peer = Peer {
+                        plain_sock: Some(socket),
+                        mid_handshake_sock: None,
+                        tls_sock: None,
+                        is_loopback,
+                        forward_domain: None,
+                        forward_id: None,
+                        loopback_id: None,
+                        forward_buf: Vec::with_capacity(1024),
+                    };
 
-                    poll.registry().register(
-                        &mut socket,
-                        id,
-                        if is_loopback {
-                            Interest::READABLE
-                        } else {
-                            Interest::READABLE.add(Interest::WRITABLE)
-                        },
-                    )?;
-
-                    ctx.connections.insert(
-                        id,
-                        Client {
-                            tls: Box::new(rustls::ServerSession::new(&ssl_ctx)),
-                            socket,
-                            peer_id: 0,
-                            is_loopback,
-                            loopback_id: 0,
-                            remote_recv: Vec::with_capacity(1024),
-                        },
-                    );
+                    let peer_id = ctx.add_peer(peer, poll.registry())?;
+                    debug!("Accepted peer {}", peer_id);
                 },
                 cli_id => {
                     if let Err(_e) = handle_client(poll.registry(), event, &mut ctx) {
-                        let mut peer_id = 0;
-                        if let Some(mut cli) = ctx.connections.remove(&Token(cli_id)) {
-                            let _ = poll.registry().deregister(&mut cli.socket);
-                            if !cli.is_loopback {
-                                //warn!("[{}] Error, closing connection : {}", cli_id, e);
-                                peer_id = cli.peer_id;
-                                cli.tls.send_close_notify();
-                                let _ = cli.tls.write_tls(&mut cli.socket);
-                            }
-                            let _ = cli.socket.shutdown(std::net::Shutdown::Both);
-                        }
-                        if peer_id != 0 {
-                            if let Some(mut cli) = ctx.connections.remove(&Token(peer_id)) {
-                                let _ = poll.registry().deregister(&mut cli.socket);
-                                if !cli.is_loopback {
-                                    //warn!("Also closing connected peer {}", peer_id);
-                                    cli.tls.send_close_notify();
-                                    let _ = cli.tls.write_tls(&mut cli.socket);
-                                }
-                                let _ = cli.socket.shutdown(std::net::Shutdown::Both);
-                            }
-                        }
+                        error!("{}", _e);
+                        cleanup_peer(cli_id, poll.registry(), &mut ctx);
                     }
                 }
             }
@@ -175,137 +186,119 @@ fn main() -> Result<()> {
     }
 }
 
-fn load_ssl_config(args: &Args) -> Result<Arc<rustls::ServerConfig>> {
-    if !args.cert.is_file() || !args.key.is_file() {
-        error!("Cert or key path does not exist !");
-        return Err(From::from("TLS init failed"));
-    }
-    info!("Loading certs & key");
-    // Read in the cert files
-    let mut cert_buf = BufReader::new(File::open(&args.cert)?);
-    let mut key_buf = BufReader::new(File::open(&args.key)?);
-    let certs = match rustls::internal::pemfile::certs(&mut cert_buf) {
-        Ok(c) => c,
-        Err(_) => {
-            error!("Failed to parse certificate");
-            return Err(From::from("TLS init failed"));
-        }
-    };
-    let key = match rustls::internal::pemfile::rsa_private_keys(&mut key_buf) {
-        Ok(mut c) => {
-            if c.len() != 1 {
-                error!("Key file must contain one cert");
-                return Err(From::from("TLS init failed"));
-            }
-            c.pop().unwrap()
-        }
-        Err(_) => {
-            error!("Failed to parse key");
-            return Err(From::from("TLS init failed"));
-        }
-    };
-    let mut ssl_config = rustls::ServerConfig::new(rustls::NoClientAuth::new());
-    if let Err(e) = ssl_config.set_single_cert(certs, key) {
-        error!("{}", e);
-        return Err(From::from("TLS init failed"));
-    }
-
-    Ok(Arc::new(ssl_config))
-}
-
 fn handle_client(registry: &Registry, event: &Event, ctx: &mut Ctx) -> Result<()> {
     let cli_id = &event.token();
-    let cli = match ctx.connections.get_mut(cli_id) {
+    let peer = match ctx.connections.get_mut(cli_id) {
         Some(c) => c,
-        None => return Err(From::from(format!("Unknown client {}", cli_id.0))),
+        None => {
+            //warn!("Unknown client {}", cli_id.0);
+            cleanup_peer(cli_id.0, registry, ctx);
+            return Ok(());
+        },
     };
 
-    if cli.is_loopback {
-        return handle_loopback(cli, event);
+    if peer.is_loopback {
+        return handle_loopback(peer, event);
     }
 
-    let forward_id;
-    let loopback_id;
-    let mut forward_data = Vec::new();
-
-    // Append data to plaintext buffer
-    if !cli.tls.is_handshaking() && !cli.remote_recv.is_empty() {
-        if let Err(e) = cli.tls.write_all(&cli.remote_recv) {
-            return Err(From::from(format!("TLS encrypt failed : {}", e)));
-        }
-        cli.remote_recv.clear();
-    }
-
-    while cli.tls.wants_write() {
-        match cli.tls.write_tls(&mut cli.socket) {
-            Ok(_n) => debug!("[{}] Sent {}", cli_id.0, _n),
-            Err(ref err) if would_block(err) => break,
-            Err(ref err) if interrupted(err) => continue,
-            Err(e) => {
-                return Err(From::from(format!("Failed to write to socket : {}", e)));
+    // Get the tls socket
+    let sock = match peer.tls_sock {
+        Some(ref mut s) => s,
+        None => {
+            // Advance the handshake state
+            match 
+                if let Some(s) = peer.plain_sock.take() {
+                    if let Some(ref domain) = peer.forward_domain {
+                        ctx.connector.connect(domain, s)
+                    } else {
+                        ctx.acceptor.accept(s)
+                    }
+                } else if let Some(s) = peer.mid_handshake_sock.take() {
+                    s.handshake()
+                } else {
+                    return Err(From::from("Invalid state"));
+                }
+            {
+                Ok(s) => {
+                    info!("[{}] TLS handshake successful", cli_id.0);
+                    peer.tls_sock = Some(s);
+                    peer.tls_sock.as_mut().unwrap()
+                },
+                Err(native_tls::HandshakeError::WouldBlock(s)) => {
+                    peer.mid_handshake_sock = Some(s);
+                    return Ok(());
+                },
+                Err(e) => return Err(From::from(format!("[{}] TCP handshake failed : {}", cli_id.0, e))),
             }
-        };
-    }
+        }
+    };
 
+    // Rececive available data
+    let mut forward_data = Vec::new();
     if event.is_readable() {
-        while cli.tls.wants_read() {
-            match cli.tls.read_tls(&mut cli.socket) {
+        loop {
+            match sock.read_to_end(&mut forward_data) {
                 Ok(0) => {
                     return Err(From::from(format!(
-                        "[{}] Failed to read from socket : read_tls returned 0",
+                        "[{}] Failed to read from socket : tls_read returned 0",
                         cli_id.0
                     )));
                 }
-                Ok(_n) => {}
+                Ok(_n) => debug!("[{}] tls_read {}", cli_id.0, _n),
                 Err(ref err) if would_block(err) => break,
                 Err(ref err) if interrupted(err) => continue,
                 // Other errors we'll consider fatal.
                 Err(e) => {
                     return Err(From::from(format!(
-                        "{} Failed to recv from client : {}",
+                        "[{}] Failed to recv from client : {}",
                         cli_id.0, e
                     )));
                 }
             }
         }
+    }
 
-        // Decrypt packets
-        if let Err(e) = cli.tls.process_new_packets() {
-            return Err(From::from(format!("TLS decrypt failed : {}", e)));
-        }
-        // Get decrypted plaintext
-        if let Err(e) = cli.tls.read_to_end(&mut forward_data) {
-            return Err(From::from(format!(
-                "[{}] Failed to read plaintext packets : {}",
-                cli_id.0, e
-            )));
-        }
+    // Send forwarded data
+    if event.is_writable() && !peer.forward_buf.is_empty() {
+        match sock.write_all(&peer.forward_buf) {
+            Ok(_) => {peer.forward_buf.clear();},
+            Err(ref err) if would_block(err) => {},
+            Err(e) => return Err(From::from(format!("Failed to tls_write : {}", e))),
+        };
+    }
 
-        if forward_data.is_empty() {
-            return Ok(());
-        }
-        // New connection
-        if cli.peer_id == 0 {
-            //Extract target domain
-            let data_str = unsafe { std::str::from_utf8_unchecked(&forward_data) };
-            let mut domain = None;
-            if let Some(mut idx_start) = data_str.find("Host: ") {
-                idx_start += "Host: ".len();
-                if let Some(idx_end) = data_str[idx_start..].find("\r\n") {
-                    domain = Some(&data_str[idx_start..idx_start + idx_end]);
-                }
+    // Check if we have received any data to forward through the proxy
+    if forward_data.is_empty() {
+        return Ok(());
+    }
+
+    // If our forwarders havent been created yet
+    if peer.forward_id.is_none() {
+        //Extract host from http request
+        let data_str = unsafe { std::str::from_utf8_unchecked(&forward_data) };
+        let mut domain = None;
+        if let Some(mut idx_start) = data_str.find("Host: ") {
+            idx_start += "Host: ".len();
+            if let Some(idx_end) = data_str[idx_start..].find("\r\n") {
+                domain = Some(&data_str[idx_start..idx_start + idx_end]);
             }
-            if domain.is_none() {
+        }
+        let domain = match domain {
+            None => {
                 return Err(From::from(
                     "Failed to extract target host from received request...",
-                ));
+                ))
             }
-            let domain = domain.unwrap();
-            let dns_name = webpki::DNSNameRef::try_from_ascii_str(domain).unwrap();
+            Some(d) => d,
+        };
 
+        let address;
+        if domain == "suenorth.ca" {
+            address = String::from("192.168.2.222");
+        } else {
             // Lookup the IP addresses associated with a name.
             let response = ctx.resolver.lookup_ip(domain).unwrap();
-            let address = match response.iter().next() {
+            address = match response.iter().next() {
                 Some(a) if a.is_ipv4() => a.to_string(),
                 Some(a) if a.is_ipv6() => a.to_string(),
                 _ => {
@@ -315,83 +308,75 @@ fn handle_client(registry: &Registry, event: &Event, ctx: &mut Ctx) -> Result<()
                     )))
                 }
             };
-
-            // Create SSL context
-            let mut config = rustls::ClientConfig::new();
-            config
-                .root_store
-                .add_server_trust_anchors(&webpki_roots::TLS_SERVER_ROOTS);
-            let config = Arc::new(config);
-
-            //Connect to plaintext loopback
-            info!("Connecting to loopback");
-            let mut loopback_sock = match TcpStream::connect(ctx.loopback_addr.parse()?) {
-                Ok(s) => s,
-                Err(e) => return Err(From::from(format!("Failed to connect to loopback : {}", e))),
-            };
-            ctx.unique_id += 1;
-            loopback_id = ctx.unique_id;
-            ctx.unique_id += 1;
-            let peer_loopback_id = ctx.unique_id;
-            ctx.loopback_id_queue.push_back(peer_loopback_id);
-            registry.register(&mut loopback_sock, Token(loopback_id), Interest::READABLE)?;
-            cli.loopback_id = loopback_id;
-            ctx.connections.insert(
-                Token(loopback_id),
-                Client {
-                    tls: Box::new(rustls::ClientSession::new(&config, dns_name)),
-                    socket: loopback_sock,
-                    is_loopback: true,
-                    loopback_id: 0,
-                    peer_id: cli_id.0,
-                    remote_recv: Vec::with_capacity(1024),
-                },
-            );
-            // Connect to real domain
-            info!("Connecting to {} ({}:{})", domain, address, ctx.remote_port);
-            let mut peer_sock =
-                match TcpStream::connect(format!("{}:{}", address, ctx.remote_port).parse()?) {
-                    Ok(s) => s,
-                    Err(e) => return Err(From::from(format!("Failed to connect to peer : {}", e))),
-                };
-            ctx.unique_id += 1;
-            forward_id = ctx.unique_id;
-            debug!("[{}] New peer {}", cli_id.0, forward_id);
-            registry.register(
-                &mut peer_sock,
-                Token(forward_id),
-                Interest::READABLE.add(Interest::WRITABLE),
-            )?;
-            ctx.connections.insert(
-                Token(forward_id),
-                Client {
-                    tls: Box::new(rustls::ClientSession::new(&config, dns_name)),
-                    socket: peer_sock,
-                    is_loopback: false,
-                    loopback_id: peer_loopback_id,
-                    peer_id: cli_id.0,
-                    remote_recv: Vec::with_capacity(1024),
-                },
-            );
-
-            print_ascii(&forward_data);
-        } else {
-            loopback_id = cli.loopback_id;
-            forward_id = cli.peer_id;
         }
 
-        //Forward to loopback
+        //Connect to plaintext loopback
+        info!("Connecting to loopback");
+        let loopback_sock = match TcpStream::connect(ctx.loopback_addr.parse()?) {
+            Ok(s) => s,
+            Err(e) => return Err(From::from(format!("Failed to connect to loopback : {}", e))),
+        };
+        let loopback_peer = Peer {
+            plain_sock: Some(loopback_sock),
+            mid_handshake_sock: None,
+            tls_sock: None,
+            is_loopback: true,
+            loopback_id: None,
+            forward_domain: None,
+            // This peer forwards data for cli_id
+            forward_id: Some(cli_id.0),
+            forward_buf: Vec::new(),
+        };
+        let loopback_id = ctx.add_peer(loopback_peer, registry)?;
+        let peer = ctx.connections.get_mut(cli_id).unwrap();
+        peer.loopback_id = Some(loopback_id);
+
+        // Connect to remote peer
+        info!("Connecting to {} ({}:{})", domain, address, ctx.remote_port);
+        let peer_sock =
+            match TcpStream::connect(format!("{}:{}", address, ctx.remote_port).parse()?) {
+                Ok(s) => s,
+                Err(e) => return Err(From::from(format!("Failed to connect to peer : {}", e))),
+            };
+        let remote_peer = Peer {
+            plain_sock: Some(peer_sock),
+            mid_handshake_sock: None,
+            tls_sock: None,
+            is_loopback: false,
+            forward_domain: Some(domain.to_owned()),
+            loopback_id: Some(loopback_id - 1),
+            forward_id: Some(cli_id.0),
+            forward_buf: Vec::new(),
+        };
+        let peer_id = ctx.add_peer(remote_peer, registry)?;
+
+        // Link current peer to remote peer
+        let peer = ctx.connections.get_mut(cli_id).unwrap();
+        peer.forward_id = Some(peer_id);  
+    }
+
+    let peer = ctx.connections.get_mut(cli_id).unwrap();
+    let loopback_id = peer.loopback_id;
+    let forward_id = peer.forward_id;
+
+    // Dump the request tos stdout
+    print_ascii(&forward_data, None);
+
+    //Forward to loopback
+    if let Some(loopback_id) = loopback_id {
         if let Some(peer) = ctx.connections.get_mut(&Token(loopback_id)) {
             debug!("Forwarding to loopback {}", loopback_id);
-            peer.remote_recv.extend(&forward_data);
+            peer.forward_buf.extend(&forward_data);
             let waker = Waker::new(registry, Token(loopback_id))?;
             waker.wake()?;
         }
+    }
 
-        //Forward to remote peer
+    //Forward to remote peer
+    if let Some(forward_id) = forward_id {
         if let Some(peer) = ctx.connections.get_mut(&Token(forward_id)) {
             debug!("Forwarding to peer {}", forward_id);
-            peer.remote_recv.extend(&forward_data);
+            peer.forward_buf.extend(&forward_data);
             let waker = Waker::new(registry, Token(forward_id))?;
             waker.wake()?;
         }
@@ -400,27 +385,14 @@ fn handle_client(registry: &Registry, event: &Event, ctx: &mut Ctx) -> Result<()
     Ok(())
 }
 
-fn handle_loopback(cli: &mut Client, event: &Event) -> Result<()> {
-    if !cli.remote_recv.is_empty() {
-        loop {
-            match cli.socket.write_all(&cli.remote_recv) {
-                Ok(_n) => break,
-                Err(ref err) if would_block(err) => break,
-                Err(ref err) if interrupted(err) => continue,
-                Err(e) => {
-                    return Err(From::from(format!("Failed to write to socket : {}", e)));
-                }
-            };
-        }
-        cli.remote_recv.clear();
-    }
-
+fn handle_loopback(cli: &mut Peer, event: &Event) -> Result<()> {
+    let sock = cli.plain_sock.as_mut().unwrap();
     // Simply flush the recv buffer
     if event.is_readable() {
         // We can (maybe) read from the connection.
         loop {
-            let mut buf = [0; 256];
-            match cli.socket.read(&mut buf) {
+            let mut buf = vec![];
+            match sock.read_to_end(&mut buf) {
                 Ok(0) => break,
                 Ok(_n) => continue,
                 // Would block "errors" are the OS's way of saying that the
@@ -431,6 +403,17 @@ fn handle_loopback(cli: &mut Client, event: &Event) -> Result<()> {
                 Err(err) => return Err(From::from(format!("loopback recv error : {}", err))),
             }
         }
+    }
+
+    if event.is_writable() && !cli.forward_buf.is_empty() {
+        match sock.write_all(&cli.forward_buf) {
+            Ok(_) => {cli.forward_buf.clear()},
+            Err(ref err) if would_block(err) => {},
+            Err(ref err) if interrupted(err) => {},
+            Err(e) => {
+                return Err(From::from(format!("Failed to write to socket : {}", e)));
+            }
+        };
     }
 
     Ok(())
@@ -444,7 +427,7 @@ fn interrupted(err: &io::Error) -> bool {
     err.kind() == io::ErrorKind::Interrupted
 }
 
-fn print_ascii(bytes: &[u8]) {
+fn print_ascii(bytes: &[u8], max_len: Option<usize>) {
     let mut res = String::with_capacity(bytes.len());
     for b in bytes {
         let ch = *b as char;
@@ -455,5 +438,59 @@ fn print_ascii(bytes: &[u8]) {
             res.push('?');
         }
     }
+
+    let max_len = match max_len {
+        Some(v) => v,
+        None => 256,
+    };
+
+    if res.len() > max_len {
+        let mut tmp = String::with_capacity(256);
+        tmp.push_str(&res[0..max_len / 2]);
+        tmp.push_str("<...>");
+        tmp.push_str(&res[res.len() - (max_len / 2)..]);
+        res = tmp;
+    }
     println!("\n\t{}", res);
 }
+
+fn cleanup_peer(peer_id: usize, registry: &Registry, ctx: &mut Ctx) {
+    
+    let mut peer = match ctx.connections.remove(&Token(peer_id)) {
+        None => return,
+        Some(p) => p,
+    };
+
+    info!("Closing peer {} {}", peer_id, if peer.is_loopback { "(Loopback)"} else {""});
+    // Close the connection cleanly
+    let sock = if let Some(ref mut sock) = peer.plain_sock {
+        let _ = registry.deregister(sock);
+        Some(sock)
+    } else if let Some(ref mut sock) = peer.mid_handshake_sock {
+        let plain_sock = sock.get_mut();
+        let _ = registry.deregister(plain_sock);
+        Some(plain_sock)
+    } else if let Some(ref mut sock) = peer.tls_sock {
+        let plain_sock = sock.get_mut();
+        let _ = registry.deregister(plain_sock);
+        Some(plain_sock)
+    } else {
+        None
+    };
+    
+    // Close TCP socket
+    if let Some(s) = sock {
+        let _ = s.shutdown(std::net::Shutdown::Both);
+    }
+
+    // Shutdown loopback streams if present
+    if let Some(loopback_id) = peer.loopback_id {
+        cleanup_peer(loopback_id, registry, ctx);
+    }
+    
+    // If we were forwarding to a remote peer, shutdown that peer too
+    if let Some(forward_id) = peer.forward_id {
+        cleanup_peer(forward_id, registry, ctx);
+    }
+}
+
