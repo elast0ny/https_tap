@@ -209,6 +209,10 @@ fn handle_client(registry: &Registry, event: &Event, ctx: &mut Ctx) -> Result<()
             match 
                 if let Some(s) = peer.plain_sock.take() {
                     if let Some(ref domain) = peer.forward_domain {
+                        // Do not send TLS handshake to quick before the non-blocking TCP connect finishes
+                        if !event.is_writable() {
+                            return Ok(())
+                        }
                         ctx.connector.connect(domain, s)
                     } else {
                         ctx.acceptor.accept(s)
