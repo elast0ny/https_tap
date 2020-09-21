@@ -12,8 +12,6 @@ log = "*"
 env_logger = "*"
 structopt = "*"
 native-tls = "*"
-webpki = "*"
-webpki-roots = "*"
 trust-dns-resolver = "*"
 
 [profile.release]

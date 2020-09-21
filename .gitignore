@@ -1,2 +1,6 @@
 /target
-/res
+/res/*.crt
+/res/*.csr
+/res/*.key
+/res/*.pfx
+/res/*.cnf

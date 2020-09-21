@@ -34,12 +34,14 @@ struct Peer {
 
 #[derive(Debug, StructOpt)]
 struct Args {
-    /// Path to the certificate chain
-    #[structopt(short, long)]
-    cert: PathBuf,
-    /// Path to the private key file
-    #[structopt(short, long)]
-    key: PathBuf,
+    /// Path to the PKCS#12 certificate chain
+    #[structopt(long)]
+    pfx: PathBuf,
+
+    /// Password for the pfx
+    #[structopt(long)]
+    pass: String,
+
     /// The IP of the interface to bind to
     #[structopt(short, long, default_value = "0.0.0.0")]
     bind: String,
@@ -108,11 +110,11 @@ fn main() -> Result<()> {
     info!("Binding to {}:{}", args.bind, args.port);
 
     // Read in certificates
-    let mut file = File::open("certs/suenorth.pfx").unwrap();
+    let mut file = File::open(&args.pfx).unwrap();
     let mut file_bytes = vec![];
     file.read_to_end(&mut file_bytes)?;
     let acceptor =
-        native_tls::TlsAcceptor::new(native_tls::Identity::from_pkcs12(&file_bytes, "letmein")?)?;
+        native_tls::TlsAcceptor::new(native_tls::Identity::from_pkcs12(&file_bytes, &args.pass)?)?;
 
     // Setup the server sockets
     let addr = format!("{}:{}", args.bind, args.port).parse().unwrap();
@@ -212,9 +214,11 @@ fn handle_client(registry: &Registry, event: &Event, ctx: &mut Ctx) -> Result<()
             match if let Some(s) = peer.plain_sock.take() {
                 if let Some(ref domain) = peer.forward_domain {
                     // Do not send TLS handshake to quick before the non-blocking TCP connect finishes
-                    if event.is_writable() || event.is_readable() {
+                    if event.is_writable() {
                         ctx.connector.connect(domain, s)
                     } else {
+                        info!("[{}] waiting for tcp connect", cli_id.0);
+                        peer.plain_sock = Some(s);
                         return Ok(());
                     }
                 } else {
@@ -249,12 +253,19 @@ fn handle_client(registry: &Registry, event: &Event, ctx: &mut Ctx) -> Result<()
         loop {
             match sock.read_to_end(&mut forward_data) {
                 Ok(0) => {
+                    warn!("[{}] tls_read failed", cli_id.0);
                     //warn!("[{}] Failed to read from socket : tls_read returned 0",cli_id.0);
                     cleanup_peer(cli_id.0, registry, ctx);
                     return Ok(());
                 }
-                Ok(_n) => debug!("[{}] tls_read {}", cli_id.0, _n),
-                Err(ref err) if would_block(err) => break,
+                Ok(_n) => {
+                    debug!("[{}] tls_read {}", cli_id.0, _n);
+                    break;
+                },
+                Err(ref err) if would_block(err) => {
+                    debug!("[{}] tls_read {}", cli_id.0, forward_data.len());
+                    break;
+                },
                 Err(ref err) if interrupted(err) => continue,
                 // Other errors we'll consider fatal.
                 Err(e) => {
@@ -268,14 +279,20 @@ fn handle_client(registry: &Registry, event: &Event, ctx: &mut Ctx) -> Result<()
     }
 
     // Send forwarded data
-    if event.is_writable() && !peer.forward_buf.is_empty() {
-        match sock.write_all(&peer.forward_buf) {
-            Ok(_) => {
-                peer.forward_buf.clear();
-            }
-            Err(ref err) if would_block(err) => {}
-            Err(e) => return Err(From::from(format!("Failed to tls_write : {}", e))),
-        };
+    while !peer.forward_buf.is_empty() {
+        if /*event.is_writable() &&*/ !peer.forward_buf.is_empty() {
+            match sock.write_all(&peer.forward_buf) {
+                Ok(_) => {
+                    debug!("[{}] tls_send {}", cli_id.0, peer.forward_buf.len());
+                    print_ascii(&peer.forward_buf, None);
+                    peer.forward_buf.clear();
+                    break;
+                }
+                Err(ref err) if would_block(err) => {continue;}
+                Err(ref err) if interrupted(err) => {continue;}
+                Err(e) => return Err(From::from(format!("Failed to tls_write : {}", e))),
+            };
+        }
     }
 
     // Check if we have received any data to forward through the proxy
@@ -374,7 +391,7 @@ fn handle_client(registry: &Registry, event: &Event, ctx: &mut Ctx) -> Result<()
     let forward_id = peer.forward_id;
 
     // Dump the request tos stdout
-    print_ascii(&forward_data, None);
+    //print_ascii(&forward_data, None);
 
     //Forward to loopback
     if let Some(loopback_id) = loopback_id {
@@ -453,17 +470,14 @@ fn print_ascii(bytes: &[u8], max_len: Option<usize>) {
         }
     }
 
-    let max_len = match max_len {
-        Some(v) => v,
-        None => 256,
-    };
-
-    if res.len() > max_len {
-        let mut tmp = String::with_capacity(256);
-        tmp.push_str(&res[0..max_len / 2]);
-        tmp.push_str("<...>");
-        tmp.push_str(&res[res.len() - (max_len / 2)..]);
-        res = tmp;
+    if let Some(max_len) = max_len {
+        if res.len() > max_len {
+            let mut tmp = String::with_capacity(256);
+            tmp.push_str(&res[0..max_len / 2]);
+            tmp.push_str("<...>");
+            tmp.push_str(&res[res.len() - (max_len / 2)..]);
+            res = tmp;
+        }
     }
     println!("\n\t{}", res);
 }
