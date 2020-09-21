@@ -76,7 +76,7 @@ impl Ctx {
             self.unique_id += 1;
             self.unique_id
         };
-        info!(
+        debug!(
             "New peer {} {}",
             id,
             if new_peer.is_loopback {
@@ -108,7 +108,7 @@ fn main() -> Result<()> {
     info!("Binding to {}:{}", args.bind, args.port);
 
     // Read in certificates
-    let mut file = File::open("res/identity.pfx").unwrap();
+    let mut file = File::open("certs/suenorth.pfx").unwrap();
     let mut file_bytes = vec![];
     file.read_to_end(&mut file_bytes)?;
     let acceptor =
@@ -234,11 +234,10 @@ fn handle_client(registry: &Registry, event: &Event, ctx: &mut Ctx) -> Result<()
                     peer.mid_handshake_sock = Some(s);
                     return Ok(());
                 }
-                Err(e) => {
-                    return Err(From::from(format!(
-                        "[{}] TCP handshake failed : {}",
-                        cli_id.0, e
-                    )))
+                Err(_e) => {
+                    //warn!("[{}] TLS handshake failed : {}", cli_id.0, e);
+                    cleanup_peer(cli_id.0, registry, ctx);
+                    return Ok(());
                 }
             }
         }
@@ -250,10 +249,7 @@ fn handle_client(registry: &Registry, event: &Event, ctx: &mut Ctx) -> Result<()
         loop {
             match sock.read_to_end(&mut forward_data) {
                 Ok(0) => {
-                    warn!(
-                        "[{}] Failed to read from socket : tls_read returned 0",
-                        cli_id.0
-                    );
+                    //warn!("[{}] Failed to read from socket : tls_read returned 0",cli_id.0);
                     cleanup_peer(cli_id.0, registry, ctx);
                     return Ok(());
                 }
@@ -326,7 +322,7 @@ fn handle_client(registry: &Registry, event: &Event, ctx: &mut Ctx) -> Result<()
         }
 
         //Connect to plaintext loopback
-        info!("Connecting to loopback");
+        debug!("Connecting to loopback");
         let loopback_sock = match TcpStream::connect(ctx.loopback_addr.parse()?) {
             Ok(s) => s,
             Err(e) => return Err(From::from(format!("Failed to connect to loopback : {}", e))),
@@ -347,7 +343,6 @@ fn handle_client(registry: &Registry, event: &Event, ctx: &mut Ctx) -> Result<()
         peer.loopback_id = Some(loopback_id);
 
         // Connect to remote peer
-        info!("Connecting to {} ({}:{})", domain, address, ctx.remote_port);
         let peer_sock =
             match TcpStream::connect(format!("{}:{}", address, ctx.remote_port).parse()?) {
                 Ok(s) => s,
@@ -364,6 +359,10 @@ fn handle_client(registry: &Registry, event: &Event, ctx: &mut Ctx) -> Result<()
             forward_buf: Vec::new(),
         };
         let peer_id = ctx.add_peer(remote_peer, registry)?;
+        info!(
+            "[{}] Forwarding traffic to [{}] {} ({}:{})",
+            cli_id.0, peer_id, domain, address, ctx.remote_port
+        );
 
         // Link current peer to remote peer
         let peer = ctx.connections.get_mut(cli_id).unwrap();
@@ -475,7 +474,7 @@ fn cleanup_peer(peer_id: usize, registry: &Registry, ctx: &mut Ctx) {
         Some(p) => p,
     };
 
-    info!(
+    debug!(
         "Closing peer {} {}",
         peer_id,
         if peer.is_loopback { "(Loopback)" } else { "" }
