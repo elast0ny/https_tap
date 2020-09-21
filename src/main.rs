@@ -10,10 +10,10 @@ use std::path::PathBuf;
 
 use env_logger::Env;
 use log::*;
+use native_tls::{MidHandshakeTlsStream, TlsAcceptor, TlsConnector, TlsStream};
 use structopt::StructOpt;
 use trust_dns_resolver::config::*;
 use trust_dns_resolver::Resolver;
-use native_tls::{TlsAcceptor, TlsConnector, TlsStream, MidHandshakeTlsStream};
 type Result<T> = std::result::Result<T, std::boxed::Box<dyn std::error::Error>>;
 
 struct Peer {
@@ -63,8 +63,7 @@ struct Ctx {
 }
 impl Ctx {
     pub fn add_peer(&mut self, mut new_peer: Peer, registry: &Registry) -> Result<usize> {
-        let id = 
-        if new_peer.is_loopback {
+        let id = if new_peer.is_loopback {
             if new_peer.forward_id.is_none() {
                 self.loopback_id_queue.pop_front().unwrap()
             } else {
@@ -77,18 +76,23 @@ impl Ctx {
             self.unique_id += 1;
             self.unique_id
         };
-        info!("New peer {} {}", id, if new_peer.is_loopback { "(Loopback)"} else {""});
+        info!(
+            "New peer {} {}",
+            id,
+            if new_peer.is_loopback {
+                "(Loopback)"
+            } else {
+                ""
+            }
+        );
         registry.register(
             new_peer.plain_sock.as_mut().unwrap(),
             Token(id),
-            Interest::READABLE.add(Interest::WRITABLE)
+            Interest::READABLE.add(Interest::WRITABLE),
         )?;
 
         // Add peer to our list of connections
-        self.connections.insert(
-            Token(id),
-            new_peer,
-        );
+        self.connections.insert(Token(id), new_peer);
 
         Ok(id)
     }
@@ -114,7 +118,6 @@ fn main() -> Result<()> {
     let addr = format!("{}:{}", args.bind, args.port).parse().unwrap();
     let mut proxy_sock = TcpListener::bind(addr)?;
     let mut loopback_sock = TcpListener::bind(args.loopback.parse()?)?;
-    
     // Create a poll instance.
     let mut poll = Poll::new()?;
     let mut events = Events::with_capacity(128);
@@ -194,7 +197,7 @@ fn handle_client(registry: &Registry, event: &Event, ctx: &mut Ctx) -> Result<()
             //warn!("Unknown client {}", cli_id.0);
             cleanup_peer(cli_id.0, registry, ctx);
             return Ok(());
-        },
+        }
     };
 
     if peer.is_loopback {
@@ -206,33 +209,37 @@ fn handle_client(registry: &Registry, event: &Event, ctx: &mut Ctx) -> Result<()
         Some(ref mut s) => s,
         None => {
             // Advance the handshake state
-            match 
-                if let Some(s) = peer.plain_sock.take() {
-                    if let Some(ref domain) = peer.forward_domain {
-                        // Do not send TLS handshake to quick before the non-blocking TCP connect finishes
-                        if !event.is_writable() {
-                            return Ok(())
-                        }
+            match if let Some(s) = peer.plain_sock.take() {
+                if let Some(ref domain) = peer.forward_domain {
+                    // Do not send TLS handshake to quick before the non-blocking TCP connect finishes
+                    if event.is_writable() || event.is_readable() {
                         ctx.connector.connect(domain, s)
                     } else {
-                        ctx.acceptor.accept(s)
+                        return Ok(());
                     }
-                } else if let Some(s) = peer.mid_handshake_sock.take() {
-                    s.handshake()
                 } else {
-                    return Err(From::from("Invalid state"));
+                    ctx.acceptor.accept(s)
                 }
-            {
+            } else if let Some(s) = peer.mid_handshake_sock.take() {
+                s.handshake()
+            } else {
+                return Err(From::from("Invalid state"));
+            } {
                 Ok(s) => {
                     info!("[{}] TLS handshake successful", cli_id.0);
                     peer.tls_sock = Some(s);
                     peer.tls_sock.as_mut().unwrap()
-                },
+                }
                 Err(native_tls::HandshakeError::WouldBlock(s)) => {
                     peer.mid_handshake_sock = Some(s);
                     return Ok(());
-                },
-                Err(e) => return Err(From::from(format!("[{}] TCP handshake failed : {}", cli_id.0, e))),
+                }
+                Err(e) => {
+                    return Err(From::from(format!(
+                        "[{}] TCP handshake failed : {}",
+                        cli_id.0, e
+                    )))
+                }
             }
         }
     };
@@ -243,10 +250,12 @@ fn handle_client(registry: &Registry, event: &Event, ctx: &mut Ctx) -> Result<()
         loop {
             match sock.read_to_end(&mut forward_data) {
                 Ok(0) => {
-                    return Err(From::from(format!(
+                    warn!(
                         "[{}] Failed to read from socket : tls_read returned 0",
                         cli_id.0
-                    )));
+                    );
+                    cleanup_peer(cli_id.0, registry, ctx);
+                    return Ok(());
                 }
                 Ok(_n) => debug!("[{}] tls_read {}", cli_id.0, _n),
                 Err(ref err) if would_block(err) => break,
@@ -265,8 +274,10 @@ fn handle_client(registry: &Registry, event: &Event, ctx: &mut Ctx) -> Result<()
     // Send forwarded data
     if event.is_writable() && !peer.forward_buf.is_empty() {
         match sock.write_all(&peer.forward_buf) {
-            Ok(_) => {peer.forward_buf.clear();},
-            Err(ref err) if would_block(err) => {},
+            Ok(_) => {
+                peer.forward_buf.clear();
+            }
+            Err(ref err) if would_block(err) => {}
             Err(e) => return Err(From::from(format!("Failed to tls_write : {}", e))),
         };
     }
@@ -356,7 +367,7 @@ fn handle_client(registry: &Registry, event: &Event, ctx: &mut Ctx) -> Result<()
 
         // Link current peer to remote peer
         let peer = ctx.connections.get_mut(cli_id).unwrap();
-        peer.forward_id = Some(peer_id);  
+        peer.forward_id = Some(peer_id);
     }
 
     let peer = ctx.connections.get_mut(cli_id).unwrap();
@@ -411,9 +422,9 @@ fn handle_loopback(cli: &mut Peer, event: &Event) -> Result<()> {
 
     if event.is_writable() && !cli.forward_buf.is_empty() {
         match sock.write_all(&cli.forward_buf) {
-            Ok(_) => {cli.forward_buf.clear()},
-            Err(ref err) if would_block(err) => {},
-            Err(ref err) if interrupted(err) => {},
+            Ok(_) => cli.forward_buf.clear(),
+            Err(ref err) if would_block(err) => {}
+            Err(ref err) if interrupted(err) => {}
             Err(e) => {
                 return Err(From::from(format!("Failed to write to socket : {}", e)));
             }
@@ -459,13 +470,16 @@ fn print_ascii(bytes: &[u8], max_len: Option<usize>) {
 }
 
 fn cleanup_peer(peer_id: usize, registry: &Registry, ctx: &mut Ctx) {
-    
     let mut peer = match ctx.connections.remove(&Token(peer_id)) {
         None => return,
         Some(p) => p,
     };
 
-    info!("Closing peer {} {}", peer_id, if peer.is_loopback { "(Loopback)"} else {""});
+    info!(
+        "Closing peer {} {}",
+        peer_id,
+        if peer.is_loopback { "(Loopback)" } else { "" }
+    );
     // Close the connection cleanly
     let sock = if let Some(ref mut sock) = peer.plain_sock {
         let _ = registry.deregister(sock);
@@ -481,7 +495,6 @@ fn cleanup_peer(peer_id: usize, registry: &Registry, ctx: &mut Ctx) {
     } else {
         None
     };
-    
     // Close TCP socket
     if let Some(s) = sock {
         let _ = s.shutdown(std::net::Shutdown::Both);
@@ -491,10 +504,8 @@ fn cleanup_peer(peer_id: usize, registry: &Registry, ctx: &mut Ctx) {
     if let Some(loopback_id) = peer.loopback_id {
         cleanup_peer(loopback_id, registry, ctx);
     }
-    
     // If we were forwarding to a remote peer, shutdown that peer too
     if let Some(forward_id) = peer.forward_id {
         cleanup_peer(forward_id, registry, ctx);
     }
 }
-
